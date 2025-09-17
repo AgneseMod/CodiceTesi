@@ -3,6 +3,7 @@
 import RPi.GPIO as GPIO
 import serial
 import time
+import traceback
 
 class sx126x:
 
@@ -297,7 +298,7 @@ class sx126x:
             # print("receive rssi value fail: ",re_temp)
             
     def send_image(self, image_path, dest_addr=0, freq=433, timeout_ack=1.0, max_retries=5):
-        CHUNK_DATA = 55  # 64 - 6(header) - 1(marker) - 2(metadati) = 55
+        CHUNK_DATA = 54  # dati effettivi per chunk
         with open(image_path, "rb") as f:
             image_data = f.read()
 
@@ -305,137 +306,151 @@ class sx126x:
         offset_freq = freq - (850 if freq > 850 else 410)
 
         HEADER_LORA = (
-            bytes([dest_addr >> 8]) + bytes([dest_addr & 0xFF]) +
+            bytes([dest_addr >> 8, dest_addr & 0xFF]) +
             bytes([offset_freq]) +
-            bytes([self.addr >> 8]) + bytes([self.addr & 0xFF]) +
+            bytes([self.addr >> 8, self.addr & 0xFF]) +
             bytes([self.offset_freq])
         )
 
-        # --- Invio IMG_START ---
+        # --- Invio IMG_START con attesa ACK ---
         MARKER_START = bytes([0x01])
-        start_payload = bytes([total_chunks])
+        start_payload = bytes([1, total_chunks])  # 1 = lunghezza payload
         start_packet = HEADER_LORA + MARKER_START + start_payload
-        self.send(start_packet)
-        print("[INFO] Inviato pacchetto IMG_START")
 
-        # --- Invio chunk DATA con attesa ACK ---
+        for retry in range(max_retries):
+            self.send(start_packet)
+            print("[INFO] Inviato IMG_START, attesa ACK...")
+            if self.wait_for_ack(0xFF, timeout=timeout_ack):
+                break
+            print(f"[WARN] ACK IMG_START non ricevuto, ritento {retry + 1}/{max_retries}")
+            time.sleep(0.05)
+        else:
+            print("[ERROR] ACK IMG_START non ricevuto, trasmissione interrotta")
+            return False
+
+        # --- Invio DATA con attesa ACK ---
         MARKER_DATA = bytes([0x02])
         for i in range(total_chunks):
             start = i * CHUNK_DATA
-            end = start + CHUNK_DATA
-            chunk = image_data[start:end]
+            chunk = image_data[start:start + CHUNK_DATA]
 
-            chunk_payload = bytes([i, total_chunks]) + chunk
-            chunk_packet = HEADER_LORA + MARKER_DATA + chunk_payload
+            # payload = [index, total_chunks, chunk...]
+            payload = bytes([i, total_chunks]) + chunk
+            payload_len = len(payload)
+
+            # pacchetto = header + marker + payload_len + payload
+            packet = HEADER_LORA + MARKER_DATA + bytes([payload_len]) + payload
 
             retry_count = 0
-            ack_received = False
-            while not ack_received and retry_count < max_retries:
-                self.send(chunk_packet)
-                print(f"[INFO] Inviato pacchetto {i+1}/{total_chunks}, in attesa ACK...")
-                ack_received = self.wait_for_ack(i, timeout=timeout_ack)
-                if not ack_received:
-                    retry_count += 1
-                    print(f"[WARN] ACK pacchetto {i+1} non ricevuto, ritento {retry_count}/{max_retries}...")
-                    time.sleep(0.05)
-
-            if not ack_received:
-                print(f"[ERROR] Pacchetto {i+1} non confermato dopo {max_retries} tentativi. Trasmissione interrotta.")
+            while retry_count < max_retries:
+                self.send(packet)
+                print(f"[INFO] Inviato pacchetto {i}/{total_chunks-1}, attesa ACK...")
+                if self.wait_for_ack(i, timeout=timeout_ack):
+                    break
+                retry_count += 1
+                print(f"[WARN] ACK pacchetto {i} non ricevuto, ritento {retry_count}/{max_retries}")
+                time.sleep(0.05)
+            else:
+                print(f"[ERROR] Pacchetto {i} non confermato, trasmissione interrotta")
                 return False
 
         # --- Invio IMG_END ---
         MARKER_END = bytes([0x03])
-        end_packet = HEADER_LORA + MARKER_END
+        end_packet = HEADER_LORA + MARKER_END + bytes([0])
         self.send(end_packet)
-        print("[INFO] Inviato pacchetto IMG_END")
+        print("[INFO] Inviato IMG_END")
         return True
 
     def receive_image_chunk(self):
-        """Riceve pacchetti immagine in ordine, invia ACK e ricostruisce l'immagine."""
-        HEADER_LORA = 6  # dimensione header LoRa
+        try:
+            HEADER_LORA = 6
+            processed = False
 
-        if not hasattr(self, 'serial_buffer'):
-            self.serial_buffer = b''
+            if not hasattr(self, "serial_buffer"):
+                self.serial_buffer = b''
 
-        # Legge tutti i byte disponibili dalla seriale
-        if self.ser.inWaiting() > 0:
-            self.serial_buffer += self.ser.read(self.ser.inWaiting())
+            # Leggi dati dalla seriale
+            if self.ser.inWaiting() > 0:
+                self.serial_buffer += self.ser.read(self.ser.inWaiting())
 
-        processed = False
+            while len(self.serial_buffer) >= HEADER_LORA + 1:
+                marker = self.serial_buffer[HEADER_LORA]
+                if marker not in (0x01, 0x02, 0x03):
+                    self.serial_buffer = self.serial_buffer[1:]
+                    continue
 
-        while len(self.serial_buffer) >= HEADER_LORA + 1:  # almeno header + marker
-            marker = self.serial_buffer[HEADER_LORA]
+                # Leggi src_addr dall'header
+                src_addr = self.serial_buffer[3] << 8 | self.serial_buffer[4]
 
-            # Determina payload minimo per tipo di pacchetto
-            if marker == 0x01:  # IMG_START
-                min_payload_len = 1
-            elif marker == 0x02:  # DATA
-                min_payload_len = 2  # index + total + chunk
-            elif marker == 0x03:  # IMG_END
-                min_payload_len = 0
-            else:
-                # Marker sconosciuto, scarta byte
-                self.serial_buffer = self.serial_buffer[1:]
-                continue
+                # Lettura lunghezza dichiarata (payload_len)
+                if len(self.serial_buffer) < HEADER_LORA + 2:
+                    break
+                payload_len = self.serial_buffer[HEADER_LORA + 1]
+                if len(self.serial_buffer) < HEADER_LORA + 2 + payload_len:
+                    print(f"[INFO] pacchetto incompleto, attesi {payload_len} byte")
+                    break
 
-            # Controlla se abbiamo abbastanza byte nel buffer
-            if len(self.serial_buffer) < HEADER_LORA + 1 + min_payload_len:
-                break  # pacchetto incompleto
+                payload = self.serial_buffer[HEADER_LORA + 2 : HEADER_LORA + 2 + payload_len]
 
-            payload = self.serial_buffer[HEADER_LORA + 1:]
-            self.serial_buffer = b''  # processiamo un pacchetto alla volta
+                if marker == 0x01:  # IMG_START
+                    self.image_receive_buffer = bytearray()
+                    self.image_expected_total = payload[0] if len(payload) > 0 else 0
+                    print(f"[INFO] IMG_START ricevuto: attesi {self.image_expected_total} pacchetti")
+                    self.send_ack(0xFF, src_addr=src_addr)
 
-            if marker == 0x01:  # IMG_START
-                self.image_receive_buffer = b''
-                self.image_expected_total = payload[0]
-                print(f"[INFO] Inizio ricezione immagine: {self.image_expected_total} pacchetti attesi")
+                elif marker == 0x02:  # DATA
+                    index = payload[0]
+                    total = payload[1]
+                    chunk = payload[2:]
+                    if not hasattr(self, "image_receive_buffer") or self.image_receive_buffer is None:
+                        self.image_receive_buffer = bytearray()
+                        print("[WARN] DATA ricevuto senza IMG_START")
+                    self.image_receive_buffer.extend(chunk)
+                    self.send_ack(index, src_addr=src_addr)
+                    print(f"[INFO] DATA ricevuto idx={index}/{total} ({len(chunk)} byte)")
+
+                elif marker == 0x03:  # IMG_END
+                    if hasattr(self, "image_receive_buffer") and self.image_receive_buffer:
+                        with open("received_image.jpg", "wb") as f:
+                            f.write(self.image_receive_buffer)
+                        print(f"[SUCCESS] IMG_END: immagine salvata ({len(self.image_receive_buffer)} byte)")
+                    self.image_receive_buffer = bytearray()
+                    self.image_expected_total = None
+
+                self.serial_buffer = self.serial_buffer[HEADER_LORA + 2 + payload_len:]
                 processed = True
 
-            elif marker == 0x02:  # DATA
-                if len(payload) < 2:
-                    break  # pacchetto incompleto
-                index = payload[0]
-                total = payload[1]
-                chunk = payload[2:]
-                self.image_receive_buffer += chunk
-                print(f"[INFO] Ricevuto pacchetto {index+1}/{total} ({len(chunk)} byte)")
-                self.send_ack(index)
-                processed = True
+            return processed
 
-            elif marker == 0x03:  # IMG_END
-                with open("received_image.jpg", "wb") as f:
-                    f.write(self.image_receive_buffer)
-                print("[SUCCESS] Immagine salvata come 'received_image.jpg'")
-                self.image_receive_buffer = b''
-                self.image_expected_total = None
-                processed = True
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return False
+            
+    def send_ack(self, index, src_addr):
+        if src_addr is None:
+            print("[ERROR] Nessun indirizzo destinatario per ACK")
+            return
 
-        return processed
-
-
-    # --- Funzioni di supporto ---
-    def send_ack(self, packet_index):
-        HEADER_LORA = 6
-        MARKER_ACK = bytes([0x04])  # marker identifica direttamente un pacchetto ACK
-        payload = bytes([packet_index])  # conferma quale pacchetto
-
-        # Costruisci pacchetto completo
-        ack_packet = (
-            bytes([self.dest_addr >> 8]) + bytes([self.dest_addr & 0xFF]) +  # destinazione
-            bytes([self.addr >> 8]) + bytes([self.addr & 0xFF]) +            # mittente
-            bytes([0]) +  # offset freq se serve
-            MARKER_ACK +
-            payload
+        HEADER_LORA = (
+            bytes([src_addr >> 8]) + bytes([src_addr & 0xFF]) +  # destinatario
+            bytes([self.offset_freq]) +                          # offset freq
+            bytes([self.addr >> 8]) + bytes([self.addr & 0xFF]) # mittente
         )
 
-        self.send(ack_packet)
-        print(f"[INFO] Inviato ACK per pacchetto {packet_index}")
+        MARKER_ACK = bytes([0x04])
+
+        # payload: 0xFF = ACK IMG_START, altrimenti indice pacchetto
+        payload = bytes([0xFF]) if index == 0xFF else bytes([index])
+
+        packet = HEADER_LORA + MARKER_ACK + payload
+        self.send(packet)
 
 
 
     def wait_for_ack(self, expected_index, timeout=1.0):
         HEADER_LORA = 6
-        MARKER_ACK = 0x04  # marker ACK
+        MARKER_ACK = 0x04
         start_time = time.time()
 
         if not hasattr(self, 'serial_buffer'):
@@ -445,19 +460,17 @@ class sx126x:
             if self.ser.inWaiting() > 0:
                 self.serial_buffer += self.ser.read(self.ser.inWaiting())
 
-            # Scorri il buffer alla ricerca di pacchetti ACK
+            # cerca pacchetti ACK nel buffer
             while len(self.serial_buffer) >= HEADER_LORA + 1 + 1:  # header + marker + payload
                 if self.serial_buffer[HEADER_LORA] != MARKER_ACK:
-                    # marker non trovato, scarta primo byte
                     self.serial_buffer = self.serial_buffer[1:]
                     continue
 
-                # ACK payload = 1 byte (indice pacchetto)
                 payload = self.serial_buffer[HEADER_LORA + 1 : HEADER_LORA + 2]
-                self.serial_buffer = self.serial_buffer[HEADER_LORA + 2:]  # rimuovi pacchetto dal buffer
+                self.serial_buffer = self.serial_buffer[HEADER_LORA + 2:]  # rimuovi pacchetto processato
 
                 if payload[0] == expected_index:
-                    return True  # ACK corretto ricevuto
+                    return True
 
             time.sleep(0.01)
 
